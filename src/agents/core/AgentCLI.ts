@@ -15,6 +15,9 @@ import { GeminiPluginMetadata } from '../plugins/gemini/gemini.plugin.js';
 import { OpenCodePluginMetadata } from '../plugins/opencode/opencode.plugin.js';
 import {ClaudeAcpPluginMetadata} from "../plugins/claude/claude-acp.plugin.js";
 import { CodexPluginMetadata } from '../plugins/codex/codex.plugin.js';
+import { createAssistantsSetupCommand } from '../../cli/commands/assistants/setup/index.js';
+import { createSkillsSetupCommand } from '../../cli/commands/skills/setup/index.js';
+import type { TargetAgent } from '../../cli/commands/shared/agent-targets.js';
 
 /**
  * Universal CLI builder for any agent
@@ -93,16 +96,31 @@ export class AgentCLI {
         await this.handleHealthCheck();
       });
 
+    if (this.isSetupCapableAgent(this.adapter.name)) {
+      const setupCommand = new Command('setup')
+        .description(`Setup ${this.adapter.displayName} integrations`);
+
+      setupCommand.addCommand(createAssistantsSetupCommand(this.adapter.name).name('assistants'));
+      setupCommand.addCommand(createSkillsSetupCommand(this.adapter.name).name('skills'));
+      this.program.addCommand(setupCommand);
+    }
+
     // Add init command for frameworks, but only when the agent binary doesn't
     // already own an 'init' subcommand (avoids shadowing the binary's native command).
     if (!this.adapter.ownedSubcommands?.includes('init')) {
       this.program
         .command('init')
         .description('Initialize development framework')
-        .argument('[framework]', 'Framework to initialize (speckit, bmad)')
+        .argument('[framework]', 'Framework to initialize (speckit, bmad, codebase-memory)')
         .option('-l, --list', 'List available frameworks')
         .option('--force', 'Force re-initialization')
         .option('--project-name <name>', 'Project name for framework initialization')
+        .option('--preset <preset>', 'Framework preset (for BMAD: sdlc, minimal, interactive)')
+        .option('--bmad-channel <channel>', 'BMAD installer channel (latest, next)')
+        .option('--bmad-modules <modules>', 'BMAD modules to install, comma-separated (for example: bmm,tea)')
+        .option('--bmad-tools <tools>', 'BMAD tool IDs to configure, comma-separated (for example: claude-code)')
+        .option('--bmad-set <key=value...>', 'BMAD module config override; repeat values after the flag')
+        .option('--interactive', 'Use the upstream interactive installer when the framework supports it')
         .action(async (framework, options) => {
           // Commander.js v11 behavior: options might be Command instance or plain object
           const opts = typeof options?.opts === 'function' ? options.opts() : options;
@@ -382,7 +400,12 @@ export class AgentCLI {
       await frameworkAdapter.init(this.adapter.name, {
         force: options.force as boolean | undefined,
         projectName: options.projectName as string | undefined,
-        cwd: process.cwd()
+        cwd: process.cwd(),
+        preset: options.interactive ? 'interactive' : options.preset,
+        bmadChannel: options.bmadChannel,
+        bmadModules: options.bmadModules,
+        bmadTools: options.bmadTools,
+        bmadSet: options.bmadSet
       });
 
     } catch (error) {
@@ -440,6 +463,10 @@ export class AgentCLI {
       'codex': CodexPluginMetadata,
     };
     return metadataMap[this.adapter.name];
+  }
+
+  private isSetupCapableAgent(agentName: string): agentName is TargetAgent {
+    return agentName === 'claude' || agentName === 'codex' || agentName === 'gemini';
   }
 
   /**
