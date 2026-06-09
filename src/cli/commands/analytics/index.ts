@@ -9,6 +9,7 @@ import { AnalyticsAggregator } from './aggregator.js';
 import { AnalyticsFormatter } from './formatter.js';
 import { AnalyticsExporter } from './exporter.js';
 import type { AnalyticsOptions, AnalyticsFilter } from './types.js';
+import type { SessionCostIndex, CostSummary } from './cost/types.js';
 import { logger } from '../../../utils/logger.js';
 
 export function createAnalyticsCommand(): Command {
@@ -26,14 +27,33 @@ export function createAnalyticsCommand(): Command {
     .option('-v, --verbose', 'Show detailed session-level breakdown')
     .option('--export <format>', 'Export to file (json or csv)')
     .option('-o, --output <path>', 'Output file path (default: ./codemie-analytics-YYYY-MM-DD.{format})')
+    .option('--report', 'Generate a self-contained HTML dashboard')
+    .option('--open', 'Open the generated HTML report in the default browser')
+    .option('--report-output <path>', 'HTML report output path (default: ./codemie-analytics-YYYY-MM-DD.html)')
+    .option('--report-format <format>', 'Report serialization: html, json, or both (default: html)')
+    .option('--no-scan-native', 'Skip native agent-log discovery (use only CodeMie-tracked sessions)')
     .action(async (options: AnalyticsOptions) => {
       try {
         // Parse filter options
         const filter = parseFilterOptions(options);
 
-        // Load data
+        // Load CodeMie-tracked sessions
         const loader = new MetricsDataLoader();
         const rawSessions = loader.loadSessions(filter);
+
+        // Discover native agent logs (plain `claude` etc. — not tracked by CodeMie) and merge,
+        // so the analytics reflect ALL usage. Deduped against tracked logs inside the loader.
+        if (options.scanNative !== false) {
+          try {
+            const { loadNativeSessions } = await import('./native-loader.js');
+            const natives = (await loadNativeSessions(filter)).filter((s) =>
+              loader.sessionMatchesFilter(s, filter)
+            );
+            rawSessions.push(...natives);
+          } catch (error) {
+            logger.debug('Native session discovery failed (continuing with tracked sessions):', error);
+          }
+        }
 
         if (rawSessions.length === 0) {
           console.log(chalk.yellow('\nNo sessions found matching the specified criteria.'));
@@ -41,8 +61,30 @@ export function createAnalyticsCommand(): Command {
           return;
         }
 
+        // A report needs cost, and cost must be computed BEFORE aggregation so that zero-delta
+        // sessions which still carry cost (empty metrics file but real usage in a correlated
+        // agent log) are retained instead of dropped as "empty". Price first, then aggregate.
+        const wantReport = Boolean(options.report || options.reportOutput || options.open || options.reportFormat);
+        const reportFormat = (options.reportFormat ?? 'html').toLowerCase();
+        if (wantReport && reportFormat !== 'html' && reportFormat !== 'json' && reportFormat !== 'both') {
+          console.log(chalk.red('\n✗ Invalid report format. Use "html", "json", or "both".'));
+          return;
+        }
+        let costResult: { index: SessionCostIndex; summary: CostSummary } | undefined;
+        let keepSessionIds: Set<string> | undefined;
+        if (wantReport) {
+          const { enrichCosts, realDeps } = await import('./cost/cost-enricher.js');
+          costResult = await enrichCosts(rawSessions, realDeps);
+          // Retain zero-delta sessions that still carry real recoverable token usage — even
+          // when the model is unpriced (costUSD === 0) — so they are not silently dropped and
+          // can surface in the unpriced-models coverage. Filtering on cost would lose them.
+          keepSessionIds = new Set(
+            [...costResult.index.values()].filter((c) => c.tokens.total > 0).map((c) => c.sessionId)
+          );
+        }
+
         // Aggregate data (normalize models unless --verbose flag is set)
-        const analytics = AnalyticsAggregator.aggregate(rawSessions, !options.verbose);
+        const analytics = AnalyticsAggregator.aggregate(rawSessions, !options.verbose, keepSessionIds);
 
         if (analytics.totalSessions === 0) {
           console.log(chalk.yellow('\nNo analytics data available.'));
@@ -69,6 +111,63 @@ export function createAnalyticsCommand(): Command {
             AnalyticsExporter.exportJSON(analytics, outputPath);
           } else {
             AnalyticsExporter.exportCSV(analytics, outputPath);
+          }
+        }
+
+        // Generate the report if requested (--report-output and --open imply --report)
+        if (wantReport && costResult) {
+          const { buildPayload } = await import('./report/payload-builder.js');
+          const { generateReport, generateReportJson, getDefaultReportPath, getDefaultReportJsonPath } =
+            await import('./report/report-generator.js');
+
+          const { index: costIndex, summary } = costResult;
+          const payload = buildPayload(analytics, costIndex, summary, {
+            rangeLabel: options.last ?? (options.from || options.to ? 'custom' : 'all'),
+            projectFilter: options.project ?? 'all',
+            generatedAt: new Date().toISOString()
+          });
+
+          const cwd = process.cwd();
+          let htmlPath: string | undefined;
+          let jsonPath: string | undefined;
+
+          if (reportFormat === 'both') {
+            // Derive a shared base (strip a trailing .html/.json from --report-output, if any)
+            // so the two artifacts are siblings and never collide, whatever extension was passed.
+            const base = options.reportOutput?.replace(/\.(html|json)$/i, '');
+            htmlPath = base ? `${base}.html` : getDefaultReportPath(cwd);
+            jsonPath = base ? `${base}.json` : getDefaultReportJsonPath(cwd);
+          } else if (reportFormat === 'html') {
+            htmlPath = options.reportOutput || getDefaultReportPath(cwd);
+          } else {
+            jsonPath = options.reportOutput || getDefaultReportJsonPath(cwd);
+          }
+
+          if (htmlPath) {
+            generateReport(payload, htmlPath);
+            console.log(chalk.green(`\n✓ HTML report written to: ${htmlPath}`));
+          }
+          if (jsonPath) {
+            generateReportJson(payload, jsonPath);
+            console.log(chalk.green(`\n✓ JSON report written to: ${jsonPath}`));
+          }
+
+          const { sessions: totalReportSessions, pricedSessions } = payload.meta.totals;
+          if (pricedSessions < totalReportSessions) {
+            console.log(
+              chalk.dim(
+                `  Cost priced for ${pricedSessions}/${totalReportSessions} sessions (native agent logs required for the rest).`
+              )
+            );
+          }
+
+          if (options.open) {
+            if (htmlPath) {
+              const { openUrlInBrowser } = await import('../../../utils/browser.js');
+              await openUrlInBrowser(htmlPath);
+            } else {
+              console.log(chalk.dim('  --open ignored: no HTML produced (use --report-format html or both).'));
+            }
           }
         }
 
@@ -141,15 +240,14 @@ function parseFilterOptions(options: AnalyticsOptions): AnalyticsFilter {
  * Parse date string (YYYY-MM-DD) to Date object
  */
 function parseDate(dateStr: string): Date | null {
-  try {
-    const date = new Date(dateStr);
-    if (isNaN(date.getTime())) {
-      return null;
-    }
-    return date;
-  } catch {
+  // Enforce the documented YYYY-MM-DD shape. Without this, `new Date()` accepts ambiguous
+  // inputs (MM/DD/YYYY, prose dates) with format-dependent timezone handling, silently
+  // producing a wrong filter window instead of triggering the caller's "invalid date" warning.
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
     return null;
   }
+  const date = new Date(dateStr);
+  return Number.isNaN(date.getTime()) ? null : date;
 }
 
 /**
