@@ -14,6 +14,9 @@
     return;
   }
 
+  // sessionId -> record, for the session-detail modal (rows carry data-session).
+  var SESSION_BY_ID = (function () { var m = {}; (DATA.sessions || []).forEach(function (s) { m[s.sessionId] = s; }); return m; })();
+
   // ---- palette ------------------------------------------------------------
   var PALETTE = ['#7C5CFC', '#2297F6', '#F5A534', '#06B6D4', '#259F4C', '#F9303C', '#C084FC', '#E879A6'];
   var AGENT_COLORS = { claude: '#7C5CFC', 'claude-acp': '#9D7BFF', 'claude-desktop': '#B79DFF', gemini: '#F5A534', codex: '#06B6D4', opencode: '#259F4C', 'codemie-code': '#2297F6' };
@@ -48,6 +51,11 @@
   }
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
   function shortPath(p) { var parts = String(p || '').split('/'); return parts[parts.length - 1] || p; }
+  // Human-readable session label: the cleaned first-prompt title, falling back to a short id.
+  function sessTitle(s) { return (s && s.title && s.title.trim()) ? s.title.trim() : ('#' + String((s && s.sessionId) || '').slice(0, 8)); }
+  function truncStr(s, n) { s = String(s == null ? '' : s); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+  // First n whitespace-delimited words (the "starting message" preview), '…' when truncated.
+  function firstWords(s, n) { s = String(s == null ? '' : s).trim(); var w = s.split(/\s+/); return w.length > n ? w.slice(0, n).join(' ') + '…' : s; }
 
   // ---- aggregation helpers ------------------------------------------------
   function sum(arr, f) { var t = 0; for (var i = 0; i < arr.length; i++) t += f(arr[i]) || 0; return t; }
@@ -222,6 +230,25 @@
     });
     host.appendChild(tgrid);
 
+    // efficiency headline KPIs (full detail on the Efficiency tab)
+    var effCacheReadCost = sum(fs, function (s) { return s.cacheReadCostUSD || 0; });
+    var effTotalCost = sum(fs, function (s) { return s.costUSD; });
+    var effCacheRead = sum(fs, function (s) { return s.tokens ? s.tokens.cacheRead : 0; });
+    var effTurns = sum(fs, function (s) { return s.turns; });
+    var effDead = fs.filter(function (s) { return s.costUSD > 0 && (s.filesChanged || 0) === 0 && s.netLines === 0; });
+    var effBloat = effTotalCost > 0 ? Math.round((effCacheReadCost / effTotalCost) * 1000) / 10 : 0;
+    var effAvgCtx = effTurns ? effCacheRead / effTurns : 0;
+    host.appendChild(el('div', 'kpi-section-label', 'Efficiency'));
+    var egrid = el('div', 'kpi-grid');
+    [['Cache-read cost', effTotalCost ? fmtUSD(effCacheReadCost) : '—', 'spend on context re-reads'],
+     ['Bloat %', effTotalCost ? (effBloat + '%') : '—', 'cache reads / total cost'],
+     ['Dead sessions', fmtNum(effDead.length), fs.length ? (Math.round((effDead.length / fs.length) * 100) + '% wasted') : ''],
+     ['Avg context / call', fmtTokens(Math.round(effAvgCtx)), 'see Efficiency tab']
+    ].forEach(function (k) {
+      var c = el('div', 'kpi'); c.appendChild(el('div', 'kpi-label', k[0])); c.appendChild(el('div', 'kpi-value', k[1])); if (k[2]) c.appendChild(el('div', 'kpi-sub', k[2])); egrid.appendChild(c);
+    });
+    host.appendChild(egrid);
+
     var row = el('div', 'grid-32 mb16');
     var trend = card('Net lines over time');
     row.appendChild(trend);
@@ -246,11 +273,18 @@
 
     // top projects
     var proj = groupBy(fs, function (s) { return s.project; });
-    var pc = card('Top projects');
-    var rows = Array.from(proj.entries()).map(function (e) { return { p: e[0], sessions: e[1].length, net: sum(e[1], function (s) { return s.netLines; }) }; })
-      .sort(function (a, b) { return b.sessions - a.sessions; }).slice(0, 8);
-    pc._body.innerHTML = tableHTML(['Project', 'Sessions', 'Net lines'],
-      rows.map(function (r) { return ['<span title="' + esc(r.p) + '">' + esc(shortPath(r.p)) + '</span>', fmtNum(r.sessions), tdNum(r.net)]; }));
+    var pc = card('Top projects', 'files changed · lines added / removed · net');
+    var rows = Array.from(proj.entries()).map(function (e) {
+      return {
+        p: e[0], sessions: e[1].length,
+        files: sum(e[1], function (s) { return s.filesChanged || 0; }),
+        added: sum(e[1], function (s) { return s.linesAdded; }),
+        removed: sum(e[1], function (s) { return s.linesRemoved; }),
+        net: sum(e[1], function (s) { return s.netLines; })
+      };
+    }).sort(function (a, b) { return b.sessions - a.sessions; }).slice(0, 8);
+    pc._body.innerHTML = tableHTML(['Project', 'Sessions', 'Files', 'Lines +', 'Lines −', 'Net lines'],
+      rows.map(function (r) { return ['<span title="' + esc(r.p) + '">' + esc(shortPath(r.p)) + '</span>', fmtNum(r.sessions), tdNum(r.files), tdNum('+' + fmtNum(r.added)), tdNum('−' + fmtNum(r.removed)), tdNum(r.net)]; }));
     host.appendChild(pc);
   };
 
@@ -328,13 +362,18 @@
     var wrap = el('div', 'table-wrapper');
     var rows = Array.from(byProj.entries()).map(function (e) { return { p: e[0], ss: e[1] }; })
       .sort(function (a, b) { return b.ss.length - a.ss.length; });
-    var html = '<table class="table"><thead><tr><th>Project</th><th class="td-number">Sessions</th><th class="td-number">Turns</th><th class="td-number">Net lines</th><th class="td-number">Tool success</th><th class="td-number">Cost</th></tr></thead><tbody>';
+    var html = '<table class="table"><thead><tr><th>Project</th><th class="td-number">Sessions</th><th class="td-number">Turns</th><th class="td-number">Files</th><th class="td-number">Lines +</th><th class="td-number">Lines −</th><th class="td-number">Net lines</th><th class="td-number">Tool success</th><th class="td-number">Cost</th></tr></thead><tbody>';
+    var crudCells = function (ss) {
+      return '<td class="td-number">' + fmtNum(sum(ss, function (s) { return s.filesChanged || 0; })) + '</td>'
+        + '<td class="td-number">+' + fmtNum(sum(ss, function (s) { return s.linesAdded; })) + '</td>'
+        + '<td class="td-number">−' + fmtNum(sum(ss, function (s) { return s.linesRemoved; })) + '</td>';
+    };
     rows.forEach(function (r, i) {
-      html += '<tr class="clickable" data-proj="' + i + '"><td>▸ ' + esc(shortPath(r.p)) + '</td><td class="td-number">' + fmtNum(r.ss.length) + '</td><td class="td-number">' + fmtNum(sum(r.ss, function (s) { return s.turns; })) + '</td><td class="td-number">' + fmtNum(sum(r.ss, function (s) { return s.netLines; })) + '</td><td class="td-number">' + successRate(r.ss) + '%</td><td class="td-number">' + fmtUSD(sum(r.ss, function (s) { return s.costUSD; })) + '</td></tr>';
+      html += '<tr class="clickable" data-proj="' + i + '"><td>▸ ' + esc(shortPath(r.p)) + '</td><td class="td-number">' + fmtNum(r.ss.length) + '</td><td class="td-number">' + fmtNum(sum(r.ss, function (s) { return s.turns; })) + '</td>' + crudCells(r.ss) + '<td class="td-number">' + fmtNum(sum(r.ss, function (s) { return s.netLines; })) + '</td><td class="td-number">' + successRate(r.ss) + '%</td><td class="td-number">' + fmtUSD(sum(r.ss, function (s) { return s.costUSD; })) + '</td></tr>';
       // branch sub-rows (hidden)
       var byBranch = groupBy(r.ss, function (s) { return s.branch || '(none)'; });
       byBranch.forEach(function (bss, b) {
-        html += '<tr class="drill" data-parent="' + i + '" style="display:none"><td style="padding-left:28px">⎇ ' + esc(b) + '</td><td class="td-number">' + bss.length + '</td><td class="td-number">' + fmtNum(sum(bss, function (s) { return s.turns; })) + '</td><td class="td-number">' + fmtNum(sum(bss, function (s) { return s.netLines; })) + '</td><td class="td-number">' + successRate(bss) + '%</td><td class="td-number">' + fmtUSD(sum(bss, function (s) { return s.costUSD; })) + '</td></tr>';
+        html += '<tr class="drill" data-parent="' + i + '" style="display:none"><td style="padding-left:28px">⎇ ' + esc(b) + '</td><td class="td-number">' + bss.length + '</td><td class="td-number">' + fmtNum(sum(bss, function (s) { return s.turns; })) + '</td>' + crudCells(bss) + '<td class="td-number">' + fmtNum(sum(bss, function (s) { return s.netLines; })) + '</td><td class="td-number">' + successRate(bss) + '%</td><td class="td-number">' + fmtUSD(sum(bss, function (s) { return s.costUSD; })) + '</td></tr>';
       });
     });
     html += '</tbody></table>';
@@ -395,6 +434,51 @@
     }
     row.appendChild(modelCard);
     host.appendChild(row);
+
+    // ── Named invocation charts ──────────────────────────────────────────────
+    var invocationDefs = [
+      { field: 'skillInvocations',   title: 'Skills invoked',  color: '#7c4fff' },
+      { field: 'agentInvocations',   title: 'Agent subtypes',  color: '#ff6b6b' },
+      { field: 'commandInvocations', title: 'Slash commands',  color: '#4a9eff' },
+    ];
+
+    invocationDefs.forEach(function (def) {
+      var agg = {};
+      fs.forEach(function (s) {
+        (s[def.field] || []).forEach(function (x) {
+          agg[x.name] = (agg[x.name] || 0) + x.totalCalls;
+        });
+      });
+      var entries = Object.entries(agg)
+        .sort(function (a, b) { return b[1] - a[1]; })
+        .slice(0, 10);
+
+      var invCard = card(def.title);
+      if (entries.length) {
+        makeChart(canvasIn(invCard._body), {
+          type: 'bar',
+          data: {
+            labels: entries.map(function (e) { return e[0]; }),
+            datasets: [{
+              data: entries.map(function (e) { return e[1]; }),
+              backgroundColor: def.color,
+              borderRadius: 4,
+            }],
+          },
+          options: {
+            indexAxis: 'y',
+            plugins: { legend: { display: false } },
+            scales: {
+              x: { grid: { color: GRID }, ticks: { precision: 0 } },
+              y: { grid: { display: false } },
+            },
+          },
+        });
+      } else {
+        invCard._body.appendChild(el('div', 'empty', 'No data.'));
+      }
+      host.appendChild(invCard);
+    });
   };
 
   VIEWS.activity = function (host, fs) {
@@ -447,6 +531,162 @@
     });
     row.appendChild(wdCard);
     host.appendChild(row);
+  };
+
+  VIEWS.efficiency = function (host, fs) {
+    host.appendChild(el('h2', 'view-title', 'Efficiency'));
+    host.appendChild(el('p', 'view-sub', 'Context usage, waste, and how efficiently sessions convert spend into work. Estimates are labelled.'));
+    if (!fs.length) { host.appendChild(el('div', 'empty', 'No sessions in view.')); return; }
+
+    // ---- context & waste KPIs ----
+    var totalCacheRead = sum(fs, function (s) { return s.tokens ? s.tokens.cacheRead : 0; });
+    var totalTurns = sum(fs, function (s) { return s.turns; });
+    var totalCost = sum(fs, function (s) { return s.costUSD; });
+    var totalCacheReadCost = sum(fs, function (s) { return s.cacheReadCostUSD || 0; });
+    var avgCtx = totalTurns ? totalCacheRead / totalTurns : 0;
+    var worst = 0, worstS = null;
+    fs.forEach(function (s) {
+      var t = s.turns || 0, cr = s.tokens ? s.tokens.cacheRead : 0, v = t ? cr / t : 0;
+      if (v > worst) { worst = v; worstS = s; }
+    });
+    var bloatPct = totalCost > 0 ? Math.round((totalCacheReadCost / totalCost) * 1000) / 10 : 0;
+
+    var grid = el('div', 'kpi-grid');
+    [['Avg context / call', fmtTokens(Math.round(avgCtx)), 'cache tokens re-read each call'],
+     ['Worst session ctx / call', fmtTokens(Math.round(worst)), worstS ? esc(truncStr(sessTitle(worstS), 28)) : ''],
+     ['Cache-read cost', totalCacheReadCost ? fmtUSD(totalCacheReadCost) : '—', totalCost ? (bloatPct + '% of spend') : 'tokens × pricing'],
+     ['Bloat %', totalCost ? (bloatPct + '%') : '—', 'spend on context re-reads']
+    ].forEach(function (k) {
+      var c = el('div', 'kpi'); c.appendChild(el('div', 'kpi-label', k[0])); c.appendChild(el('div', 'kpi-value', k[1])); if (k[2]) c.appendChild(el('div', 'kpi-sub', k[2])); grid.appendChild(c);
+    });
+    host.appendChild(grid);
+
+    // ---- avg context/call per session (bar) + most bloated sessions (table) ----
+    var row1 = el('div', 'grid-2 mb16');
+    var ctxCard = card('Avg context / call per session', 'top 20 by context re-read');
+    var withCtx = fs.map(function (s) {
+      var t = s.turns || 0, cr = s.tokens ? s.tokens.cacheRead : 0;
+      return { s: s, v: t ? cr / t : 0 };
+    }).filter(function (x) { return x.v > 0; }).sort(function (a, b) { return b.v - a.v; }).slice(0, 20);
+    if (withCtx.length) {
+      var ctxTitles = withCtx.map(function (x) { return sessTitle(x.s); });
+      makeChart(canvasIn(ctxCard._body), {
+        type: 'bar',
+        data: { labels: withCtx.map(function (x) { return truncStr(sessTitle(x.s), 18); }), datasets: [{ data: withCtx.map(function (x) { return Math.round(x.v); }), backgroundColor: '#F5A534', borderRadius: 4 }] },
+        options: { plugins: { legend: { display: false }, tooltip: { callbacks: { title: function (items) { return ctxTitles[items[0].dataIndex]; }, label: function (c) { return fmtTokens(c.parsed.y) + ' / call'; } } } }, scales: { x: { grid: { display: false }, ticks: { maxTicksLimit: 12 } }, y: { grid: { color: GRID }, ticks: { callback: function (v) { return fmtTokens(v); } } } } }
+      });
+    } else { ctxCard._body.appendChild(el('div', 'empty', 'No cache-read data.')); }
+    row1.appendChild(ctxCard);
+
+    var bloatCard = card('Most bloated sessions', 'highest context re-read per call');
+    bloatCard._body.style.paddingTop = '0';
+    var bloated = fs.map(function (s) {
+      var t = s.turns || 0, cr = s.tokens ? s.tokens.cacheRead : 0;
+      return { s: s, ctx: t ? cr / t : 0, bloat: s.costUSD > 0 ? ((s.cacheReadCostUSD || 0) / s.costUSD) * 100 : 0 };
+    }).filter(function (x) { return x.ctx > 0; }).sort(function (a, b) { return b.ctx - a.ctx; }).slice(0, 10);
+    bloatCard._body.innerHTML = '<div class="table-wrapper">' + tableHTML(
+      ['Session', 'Agent', 'Model', 'Ctx/call', 'Cache read', 'Cost', 'Bloat%'],
+      bloated.map(function (x) {
+        var s = x.s;
+        return ['<span title="' + esc(sessTitle(s)) + '">' + esc(truncStr(sessTitle(s), 44)) + '</span>',
+          '<span class="tag tag-sm" style="text-transform:capitalize">' + esc(s.agentName) + '</span>',
+          '<span class="tag tag-sm">' + esc((s.models && s.models[0]) || '—') + '</span>',
+          fmtTokens(Math.round(x.ctx)), fmtTokens(s.tokens ? s.tokens.cacheRead : 0), fmtUSD(s.costUSD), (Math.round(x.bloat * 10) / 10) + '%'];
+      }),
+      [false, false, false, true, true, true, true],
+      bloated.map(function (x) { return 'class="clickable" data-session="' + esc(x.s.sessionId) + '"'; })) + '</div>';
+    bloatCard._body.addEventListener('click', function (ev) {
+      var tr = ev.target.closest('tr[data-session]'); if (!tr) return;
+      openSessionModal(SESSION_BY_ID[tr.getAttribute('data-session')]);
+    });
+    row1.appendChild(bloatCard);
+    host.appendChild(row1);
+
+    // ---- dead sessions ----
+    var dead = fs.filter(function (s) { return s.costUSD > 0 && (s.filesChanged || 0) === 0 && s.netLines === 0; });
+    var deadCost = sum(dead, function (s) { return s.costUSD; });
+    var deadCard = card('Dead sessions', 'cost spent, zero files changed and zero net lines — pure inference waste');
+    var dkv = el('div', 'kpi-grid'); dkv.style.gridTemplateColumns = 'repeat(3,1fr)';
+    [['Dead sessions', fmtNum(dead.length), fs.length ? (Math.round((dead.length / fs.length) * 100) + '% of sessions') : ''],
+     ['Wasted cost', fmtUSD(deadCost), totalCost ? (Math.round((deadCost / totalCost) * 100) + '% of spend') : ''],
+     ['Avg cost / dead', dead.length ? fmtUSD(deadCost / dead.length) : '—', 'per unproductive session']
+    ].forEach(function (k) {
+      var c = el('div', 'kpi'); c.appendChild(el('div', 'kpi-label', k[0])); c.appendChild(el('div', 'kpi-value', k[1])); if (k[2]) c.appendChild(el('div', 'kpi-sub', k[2])); dkv.appendChild(c);
+    });
+    deadCard._body.appendChild(dkv);
+    if (dead.length) {
+      var topDead = dead.slice().sort(function (a, b) { return b.costUSD - a.costUSD; }).slice(0, 10);
+      var dw = el('div', 'table-wrapper');
+      dw.innerHTML = tableHTML(['Session', 'Agent', 'Model', 'Turns', 'Cost'],
+        topDead.map(function (s) {
+          return ['<span title="' + esc(sessTitle(s)) + '">' + esc(truncStr(sessTitle(s), 44)) + '</span>',
+            '<span class="tag tag-sm" style="text-transform:capitalize">' + esc(s.agentName) + '</span>',
+            '<span class="tag tag-sm">' + esc((s.models && s.models[0]) || '—') + '</span>',
+            fmtNum(s.turns), fmtUSD(s.costUSD)];
+        }), [false, false, false, true, true]);
+      deadCard._body.appendChild(dw);
+    }
+    host.appendChild(deadCard);
+
+    // ---- session depth + command effectiveness ----
+    var row2 = el('div', 'grid-2 mb16');
+    var depthCard = card('Session depth', 'turns per session — long runs that never compact/restart');
+    var buckets = [['1', function (t) { return t <= 1; }], ['2–5', function (t) { return t >= 2 && t <= 5; }], ['6–10', function (t) { return t >= 6 && t <= 10; }], ['11–25', function (t) { return t >= 11 && t <= 25; }], ['26–50', function (t) { return t >= 26 && t <= 50; }], ['50+', function (t) { return t > 50; }]];
+    var counts = buckets.map(function (b) { return fs.filter(function (s) { return b[1](s.turns || 0); }).length; });
+    makeChart(canvasIn(depthCard._body), {
+      type: 'bar', data: { labels: buckets.map(function (b) { return b[0]; }), datasets: [{ data: counts, backgroundColor: '#7C5CFC', borderRadius: 4 }] },
+      options: { plugins: { legend: { display: false } }, scales: { x: { grid: { display: false } }, y: { grid: { color: GRID }, ticks: { precision: 0 } } } }
+    });
+    var turnsArr = fs.map(function (s) { return s.turns || 0; }).sort(function (a, b) { return a - b; });
+    var median = 0;
+    if (turnsArr.length) {
+      var mid = Math.floor(turnsArr.length / 2);
+      median = turnsArr.length % 2 ? turnsArr[mid] : Math.round((turnsArr[mid - 1] + turnsArr[mid]) / 2);
+    }
+    var avgTurns = fs.length ? Math.round(totalTurns / fs.length) : 0;
+    depthCard._body.appendChild(el('p', 'text-muted', '<span style="font-size:12px">median ' + median + ' · avg ' + avgTurns + ' turns / session</span>'));
+    row2.appendChild(depthCard);
+
+    var cmdCard = card('Command effectiveness', 'est. cost per file changed, by command (session cost → its dominant command)');
+    // null-proto map: command names are data-derived, so a name like "__proto__" must not alias Object.prototype.
+    var cmdAgg = Object.create(null);
+    fs.forEach(function (s) {
+      var cmds = s.commandInvocations || [];
+      if (!cmds.length) return;
+      var dom = cmds.slice().sort(function (a, b) { return b.totalCalls - a.totalCalls; })[0];
+      var cur = cmdAgg[dom.name] || { cost: 0, artifacts: 0 };
+      cur.cost += s.costUSD; cur.artifacts += (s.filesChanged || 0);
+      cmdAgg[dom.name] = cur;
+    });
+    var cmdEntries = Object.keys(cmdAgg).map(function (name) {
+      var a = cmdAgg[name];
+      return { name: name, perArtifact: a.artifacts > 0 ? a.cost / a.artifacts : 0 };
+    }).filter(function (x) { return x.perArtifact > 0; }).sort(function (a, b) { return a.perArtifact - b.perArtifact; }).slice(0, 10);
+    if (cmdEntries.length) {
+      makeChart(canvasIn(cmdCard._body), {
+        type: 'bar',
+        data: { labels: cmdEntries.map(function (e) { return e.name; }), datasets: [{ data: cmdEntries.map(function (e) { return Math.round(e.perArtifact * 100) / 100; }), backgroundColor: '#06B6D4', borderRadius: 4 }] },
+        options: { indexAxis: 'y', plugins: { legend: { display: false }, tooltip: { callbacks: { label: function (c) { return fmtUSD(c.parsed.x) + ' / file'; } } } }, scales: { x: { grid: { color: GRID }, ticks: { callback: function (v) { return fmtUSD(v); } } }, y: { grid: { display: false } } } }
+      });
+    } else { cmdCard._body.appendChild(el('div', 'empty', 'No command + artifact data.')); }
+    row2.appendChild(cmdCard);
+    host.appendChild(row2);
+
+    // ---- code changes ----
+    var changeCard = card('Code changes', 'files & lines changed across sessions in view');
+    var cg = el('div', 'kpi-grid');
+    [['Files changed', fmtNum(sum(fs, function (s) { return s.filesChanged || 0; })), 'written or edited'],
+     ['Files written', fmtNum(sum(fs, function (s) { return s.filesWritten || 0; })), 'Write tool'],
+     ['Files edited', fmtNum(sum(fs, function (s) { return s.filesEdited || 0; })), 'Edit tool'],
+     ['Lines added', '+' + fmtNum(sum(fs, function (s) { return s.linesAdded; })), ''],
+     ['Lines removed', '−' + fmtNum(sum(fs, function (s) { return s.linesRemoved; })), ''],
+     ['Net lines', (sum(fs, function (s) { return s.netLines; }) >= 0 ? '+' : '') + fmtNum(sum(fs, function (s) { return s.netLines; })), '']
+    ].forEach(function (k) {
+      var c = el('div', 'kpi'); c.appendChild(el('div', 'kpi-label', k[0])); c.appendChild(el('div', 'kpi-value', k[1])); if (k[2]) c.appendChild(el('div', 'kpi-sub', k[2])); cg.appendChild(c);
+    });
+    changeCard._body.appendChild(cg);
+    changeCard._body.appendChild(el('p', 'text-muted', '<span style="font-size:12px">File deletions and line-level "modified" counts aren\'t tracked; Write counts the whole file as added.</span>'));
+    host.appendChild(changeCard);
   };
 
   VIEWS.cost = function (host, fs) {
@@ -536,6 +776,12 @@
     bar.appendChild(input); host.appendChild(bar);
     var c = card('All sessions'); c._body.style.paddingTop = '0';
     var holder = el('div', 'table-wrapper'); c._body.appendChild(holder); host.appendChild(c);
+    // Delegated row → modal. Attached ONCE on the persistent holder (draw() re-sets innerHTML
+    // on every keystroke, so a listener inside draw would stack and fire N times).
+    holder.addEventListener('click', function (ev) {
+      var tr = ev.target.closest('tr[data-session]'); if (!tr) return;
+      openSessionModal(SESSION_BY_ID[tr.getAttribute('data-session')]);
+    });
 
     function draw(q) {
       var list = fs.slice().sort(function (a, b) { return b.startTime - a.startTime; });
@@ -543,33 +789,220 @@
         var ql = q.toLowerCase();
         list = list.filter(function (s) { return (s.sessionId + ' ' + s.agentName + ' ' + s.project + ' ' + s.branch).toLowerCase().indexOf(ql) >= 0; });
       }
+      var shown = list.slice(0, 300);
       holder.innerHTML = tableHTML(
         ['Date', 'Agent', 'Project', 'Branch', 'Turns', 'Net lines', 'Input', 'Output', 'Cached', 'Cost'],
-        list.slice(0, 300).map(function (s) {
+        shown.map(function (s) {
           return [new Date(s.startTime).toISOString().slice(0, 16).replace('T', ' '),
             '<span class="tag tag-sm" style="text-transform:capitalize">' + esc(s.agentName) + '</span>',
             '<span title="' + esc(s.project) + '">' + esc(shortPath(s.project)) + '</span>', esc(s.branch || '—'),
             fmtNum(s.turns), fmtNum(s.netLines), fmtTokens(tkIn(s)), fmtTokens(tkOut(s)), fmtTokens(tkCached(s)), fmtUSD(s.costUSD)];
         }),
-        [false, false, false, false, true, true, true, true, true, true]);
+        [false, false, false, false, true, true, true, true, true, true],
+        shown.map(function (s) { return 'class="clickable" data-session="' + esc(s.sessionId) + '"'; }));
       if (list.length > 300) holder.appendChild(el('p', 'text-muted', '<span style="font-size:12px">Showing first 300 of ' + list.length + '.</span>'));
     }
     input.addEventListener('input', function () { draw(input.value.trim()); });
     draw('');
   };
 
+  // ---- session-detail modal ----------------------------------------------
+  var modalChart = null; // owned by the modal; NOT in the global charts[] (decoupled from destroyCharts()).
+  var modalEsc = null;
+  function closeSessionModal() {
+    if (modalChart) { try { modalChart.destroy(); } catch (e) {} modalChart = null; }
+    if (modalEsc) { document.removeEventListener('keydown', modalEsc); modalEsc = null; }
+    var ov = document.getElementById('session-modal'); if (ov && ov.parentNode) ov.parentNode.removeChild(ov);
+  }
+  var MODAL_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  function fmtWhen(ms) { var d = new Date(ms); return MODAL_MONTHS[d.getMonth()] + ' ' + d.getDate() + ', ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
+  function hashStr(s) { var h = 0; s = String(s); for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return Math.abs(h); }
+  // Lighter, borderless stat grid (label + value), replacing the heavy box-in-box KPI cards.
+  function statsEl(items) { // items: [label, value(html-safe), sub]
+    var g = el('div', 'modal-stats');
+    items.forEach(function (k) {
+      var c = el('div', 'mstat');
+      c.appendChild(el('div', 'mlabel', esc(k[0])));
+      c.appendChild(el('div', 'mval', k[1])); // value is formatter output (fmt*), not user text
+      if (k[2]) c.appendChild(el('div', 'msub', esc(k[2])));
+      g.appendChild(c);
+    });
+    return g;
+  }
+  function sumCalls(list) { return (list || []).reduce(function (a, n) { return a + (n.totalCalls || 0); }, 0); }
+  // Name→count list for a dispatch kind, derived from the timed native-log dispatches (the timeline's
+  // source) so counts/chips stay consistent with it; falls back to the tracked named-invocation
+  // counts when this session has no dispatch data (e.g. older/tracked-only sessions).
+  function dispatchCounts(s, kind) {
+    var disp = (s.dispatches || []).filter(function (d) { return d.kind === kind; });
+    if (disp.length) {
+      var m = {};
+      disp.forEach(function (d) { m[d.name] = (m[d.name] || 0) + 1; });
+      return Object.keys(m).map(function (n) { return { name: n, totalCalls: m[n] }; });
+    }
+    return kind === 'agent' ? (s.agentInvocations || []) : kind === 'skill' ? (s.skillInvocations || []) : (s.commandInvocations || []);
+  }
+  function chipsEl(title, list) { // list: NamedInvocationStats[]
+    var sec = el('div', 'dispatch-col');
+    sec.appendChild(el('h4', null, esc(title) + ' (' + (list ? list.length : 0) + ')'));
+    if (!list || !list.length) { sec.appendChild(el('div', 'text-muted', '<span style="font-size:12px">none</span>')); return sec; }
+    var wrap = el('div', 'modal-chips');
+    list.slice().sort(function (a, b) { return b.totalCalls - a.totalCalls; }).forEach(function (n) {
+      wrap.appendChild(el('span', 'chip', esc(n.name) + '<b>×' + fmtNum(n.totalCalls) + '</b>'));
+    });
+    sec.appendChild(wrap); return sec;
+  }
+  // One timeline row: label + track with a positioned bar + a right-aligned duration. All text esc()'d.
+  function tlRow(label, color, leftPct, wPct, durText, barText, strong) {
+    var row = el('div', 'tl-row');
+    row.appendChild(el('div', 'tl-label' + (strong ? ' tl-label-strong' : ''), esc(label)));
+    var track = el('div', 'tl-track');
+    var bar = el('div', 'tl-bar');
+    bar.style.left = leftPct + '%'; bar.style.width = wPct + '%'; bar.style.background = color;
+    if (barText) bar.innerHTML = '<span class="tl-bar-text">' + esc(barText) + '</span>'; // only wide (session) bar
+    bar.title = label + ' · ' + durText; // .title property = safe (not parsed as HTML)
+    track.appendChild(bar); row.appendChild(track);
+    row.appendChild(el('div', 'tl-dur', esc(durText)));
+    return row;
+  }
+  // Gantt of top-level agent dispatches: session span on top, each dispatch positioned by start.
+  function timelineEl(s) {
+    var agents = (s.dispatches || []).filter(function (d) { return d.kind === 'agent'; });
+    var start = s.startTime;
+    var end = start + (s.durationMs || 0);
+    (s.dispatches || []).forEach(function (d) { var e = d.start + (d.durationMs || 0); if (e > end) end = e; });
+    var span = Math.max(1, end - start);
+    var wrap = el('div', 'timeline');
+    wrap.appendChild(tlRow('session', '#259F4C', 0, 100, fmtDuration(s.durationMs || 0), fmtUSD(s.costUSD), true));
+    var occ = {};
+    agents.forEach(function (d) {
+      var total = agents.filter(function (x) { return x.name === d.name; }).length;
+      occ[d.name] = (occ[d.name] || 0) + 1;
+      var label = d.name + (total > 1 ? ' #' + occ[d.name] : '');
+      var leftPct = ((d.start - start) / span) * 100;
+      var wPct = Math.max(((d.durationMs || 0) / span) * 100, 1.5);
+      if (leftPct + wPct > 100) leftPct = Math.max(0, 100 - wPct);
+      wrap.appendChild(tlRow(label, PALETTE[hashStr(d.name) % PALETTE.length], leftPct, wPct, fmtDuration(d.durationMs || 0), '', false));
+    });
+    return wrap;
+  }
+  function openSessionModal(s) {
+    if (!s) return;
+    closeSessionModal();
+    var ov = el('div', 'modal-overlay'); ov.id = 'session-modal';
+    var modal = el('div', 'modal');
+
+    // header — every interpolation through esc(); title is arbitrary user text (XSS vector).
+    var head = el('div', 'modal-head');
+    var htxt = el('div');
+    htxt.appendChild(el('div', 'modal-title', esc(truncStr(firstWords(sessTitle(s), 10), 120))));
+    var metaBits = [s.agentName, (s.models && s.models[0]) || null, shortPath(s.project), s.branch].filter(Boolean);
+    htxt.appendChild(el('div', 'modal-meta', metaBits.map(function (b) { return esc(b); }).join('  ·  ')));
+    head.appendChild(htxt);
+    var close = el('button', 'modal-close', '✕'); close.setAttribute('aria-label', 'Close'); close.addEventListener('click', closeSessionModal);
+    head.appendChild(close);
+    modal.appendChild(head);
+
+    var body = el('div', 'modal-body');
+
+    // Cost & Time / Token Usage / Activity — light borderless stats, equal-height cards.
+    var t = s.tokens || { input: 0, output: 0, cacheRead: 0, cacheCreation: 0, total: 0 };
+    var grid3 = el('div', 'grid-3');
+    var costCard = card('Cost & Time'); costCard._body.appendChild(statsEl([
+      ['Cost', fmtUSD(s.costUSD), 'API-equivalent'],
+      ['Cache-read', s.cacheReadCostUSD ? fmtUSD(s.cacheReadCostUSD) : '—', ''],
+      ['Duration', fmtDuration(s.durationMs || 0), ''],
+      ['Started', '<span class="mval-sm">' + esc(fmtWhen(s.startTime)) + '</span>', '']
+    ]));
+    var tokCard = card('Token usage'); tokCard._body.appendChild(statsEl([
+      ['Input', fmtTokens(t.input), ''], ['Output', fmtTokens(t.output), ''],
+      ['Cache read', fmtTokens(t.cacheRead), ''], ['Cache create', fmtTokens(t.cacheCreation), ''],
+      ['Total', fmtTokens(t.total), '']
+    ]));
+    var actCard = card('Activity'); actCard._body.appendChild(statsEl([
+      ['Turns / API', fmtNum(s.turns), ''],
+      ['Tool calls', fmtNum(s.toolCallsTotal), (s.toolCallsTotal ? Math.round((s.toolCallsSuccess / s.toolCallsTotal) * 100) + '% ok' : '')],
+      ['Agents', fmtNum(sumCalls(dispatchCounts(s, 'agent'))), ''],
+      ['Skills', fmtNum(sumCalls(dispatchCounts(s, 'skill'))), ''],
+      ['Commands', fmtNum(sumCalls(dispatchCounts(s, 'command'))), '']
+    ]));
+    grid3.appendChild(costCard); grid3.appendChild(tokCard); grid3.appendChild(actCard);
+    body.appendChild(grid3);
+
+    // Code changes
+    var ccCard = card('Code changes'); ccCard._body.appendChild(statsEl([
+      ['Files changed', fmtNum(s.filesChanged || 0), 'written or edited'],
+      ['Lines added', '+' + fmtNum(s.linesAdded || 0), ''],
+      ['Lines removed', '−' + fmtNum(s.linesRemoved || 0), ''],
+      ['Net lines', ((s.netLines || 0) >= 0 ? '+' : '') + fmtNum(s.netLines || 0), '']
+    ]));
+    body.appendChild(ccCard);
+
+    // Token & cost growth chart (backfilled per-turn series; honest fallback when absent)
+    var growth = card('Token & cost growth', 'cumulative per turn — from the native log');
+    var series = s.costSeries || [];
+    if (series.length >= 2 && window.Chart) {
+      var useTs = series[0].t > 1e12; // epoch ms vs turn ordinal
+      var t0 = series[0].t;
+      var labels = series.map(function (p) { return useTs ? fmtDuration(Math.max(0, p.t - t0)) : ('turn ' + p.t); });
+      var cv = canvasIn(growth._body, 220);
+      modalChart = new Chart(cv, {
+        type: 'line',
+        data: { labels: labels, datasets: [
+          { label: 'Cost ($)', data: series.map(function (p) { return Math.round(p.cost * 10000) / 10000; }), borderColor: '#7C5CFC', backgroundColor: 'rgba(124,92,252,0.12)', fill: true, yAxisID: 'y', tension: 0.25, pointRadius: 0 },
+          { label: 'Tokens', data: series.map(function (p) { return p.tokens; }), borderColor: '#F5A534', backgroundColor: 'transparent', fill: false, yAxisID: 'y1', tension: 0.25, pointRadius: 0 }
+        ] },
+        options: { interaction: { mode: 'index', intersect: false }, plugins: { legend: { display: true } },
+          scales: { x: { grid: { display: false }, ticks: { maxTicksLimit: 8 } },
+            y: { position: 'left', grid: { color: GRID }, ticks: { callback: function (v) { return fmtUSD(v); } } },
+            y1: { position: 'right', grid: { display: false }, ticks: { callback: function (v) { return fmtTokens(v); } } } } }
+      });
+    } else {
+      growth._body.appendChild(el('div', 'empty', 'Per-turn data not available for this session.'));
+    }
+    body.appendChild(growth);
+
+    // Timeline — Gantt of top-level agent dispatches with durations (per-agent cost is not captured).
+    var hasAgents = (s.dispatches || []).some(function (d) { return d.kind === 'agent'; });
+    var tlCard = card('Timeline', hasAgents ? 'agent dispatches over the session · durations (per-agent cost is not captured)' : '');
+    if (hasAgents) {
+      tlCard._body.appendChild(timelineEl(s));
+    } else {
+      tlCard._body.appendChild(el('div', 'empty', 'No sub-agent dispatches recorded for this session.'));
+    }
+    body.appendChild(tlCard);
+
+    // Skills & commands — invoked names + counts.
+    var scCard = card('Skills & commands', 'invoked by name');
+    var cols = el('div', 'dispatch-cols');
+    cols.appendChild(chipsEl('Skills', dispatchCounts(s, 'skill')));
+    cols.appendChild(chipsEl('Commands', dispatchCounts(s, 'command')));
+    scCard._body.appendChild(cols);
+    body.appendChild(scCard);
+
+    modal.appendChild(body);
+    ov.appendChild(modal);
+    ov.addEventListener('click', function (ev) { if (ev.target === ov) closeSessionModal(); });
+    modalEsc = function (ev) { if (ev.key === 'Escape') closeSessionModal(); };
+    document.addEventListener('keydown', modalEsc);
+    document.body.appendChild(ov);
+  }
+
   // ---- table + misc helpers ----------------------------------------------
   function tdNum(v) { return '<span class="td-number">' + (typeof v === 'number' ? fmtNum(v) : v) + '</span>'; }
   // numericCols: optional boolean[] marking right-aligned numeric columns. Default = every
   // column except the first (back-compat). Text columns (agent, project, branch, status) must
   // be left-aligned, so callers with interleaved/leading text pass an explicit mask.
-  function tableHTML(headers, rows, numericCols) {
+  function tableHTML(headers, rows, numericCols, rowAttrs) {
     var isNum = numericCols || headers.map(function (_, i) { return i > 0; });
     var h = '<table class="table"><thead><tr>';
     headers.forEach(function (x, i) { h += '<th' + (isNum[i] ? ' class="td-number"' : '') + '>' + esc(x) + '</th>'; });
     h += '</tr></thead><tbody>';
     if (!rows.length) h += '<tr><td colspan="' + headers.length + '" class="text-muted">No data</td></tr>';
-    rows.forEach(function (r) { h += '<tr>' + r.map(function (cell, i) { return '<td' + (isNum[i] ? ' class="td-number"' : '') + '>' + cell + '</td>'; }).join('') + '</tr>'; });
+    rows.forEach(function (r, ri) {
+      var attrs = rowAttrs && rowAttrs[ri] ? ' ' + rowAttrs[ri] : '';
+      h += '<tr' + attrs + '>' + r.map(function (cell, i) { return '<td' + (isNum[i] ? ' class="td-number"' : '') + '>' + cell + '</td>'; }).join('') + '</tr>';
+    });
     return h + '</tbody></table>';
   }
   // tokens shorthand: cached = cacheRead + cacheCreation (the prompt-cache reuse + writes)
@@ -586,6 +1019,7 @@
   }
 
   function render() {
+    closeSessionModal();
     applyChartTheme();
     destroyCharts();
     root.innerHTML = '';
