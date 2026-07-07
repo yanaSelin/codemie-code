@@ -365,7 +365,8 @@ export function formatErrorForUser(
 
   // Error message (just the message, not the name) - wrapped at 100 chars
   const wrappedError = wrapText(context.error.message, 97, '   '); // 97 to account for "❌ " prefix
-  lines.push(`❌ ${wrappedError[0].trim()}`);
+  const firstLine = wrappedError.length > 0 ? wrappedError[0].trim() : context.error.message || '(unknown error)';
+  lines.push(`❌ ${firstLine}`);
   for (let i = 1; i < wrappedError.length; i++) {
     lines.push(wrappedError[i]);
   }
@@ -536,7 +537,8 @@ export function formatErrorWithExplanation(
 
   // Explanation first (user-friendly) - wrapped at 100 chars
   const wrappedExplanation = wrapText(explanation, 97, '   '); // 97 to account for "💡 " prefix
-  lines.push(`💡 ${wrappedExplanation[0].trim()}`);
+  const firstExplanationLine = wrappedExplanation.length > 0 ? wrappedExplanation[0].trim() : explanation || '(no explanation)';
+  lines.push(`💡 ${firstExplanationLine}`);
   for (let i = 1; i < wrappedExplanation.length; i++) {
     lines.push(wrappedExplanation[i]);
   }
@@ -552,7 +554,8 @@ export function formatErrorWithExplanation(
     suggestions.forEach(suggestion => {
       // Wrap each suggestion at 100 chars, accounting for "  • " prefix
       const wrappedSuggestion = wrapText(suggestion, 96, '    '); // 96 to account for "  • " prefix
-      lines.push(`  • ${wrappedSuggestion[0].trim()}`);
+      const firstSuggestionLine = wrappedSuggestion.length > 0 ? wrappedSuggestion[0].trim() : suggestion;
+      lines.push(`  • ${firstSuggestionLine}`);
       for (let i = 1; i < wrappedSuggestion.length; i++) {
         lines.push(wrappedSuggestion[i]);
       }
