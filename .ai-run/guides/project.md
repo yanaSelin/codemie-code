@@ -37,3 +37,21 @@
 **Status**: configured
 **Adapter**: Invoke the `codemie-pr` skill via the Skill tool.
 **Instructions**: The `codemie-pr` skill checks current branch state via `gh pr list --head $(git branch --show-current)` and avoids creating duplicate PRs; it follows Conventional Commits and the project Squash-and-Merge default. Pass the user's intent ("commit changes", "push", "create PR") verbatim as the skill argument.
+
+## Lifecycle Intent Handling
+
+### record_complexity_score
+Invoke the `codemie-jira-assistant` skill and ask it to update the ticket's complexity score (Total Score) with the value from `data.complexity_total`.
+Ticket ID: extract from the current branch name (pattern `EPMCDME-\d+`) or from the run work item.
+
+### artifact_published
+Invoke the `codemie-jira-assistant` skill and attach the artifact file using the `--file` flag:
+
+```bash
+codemie assistants chat "289d2751-afd9-4c77-a272-90df7cd71702" \
+  "Attach this file to Jira ticket EPMCDME-<ID> as the approved <kind> artifact." \
+  --file "<path-to-artifact>"
+```
+
+Ticket ID: extract from the current branch name (pattern `EPMCDME-\d+`) or from the run work item.
+`<path-to-artifact>`: use `data.artifact_path`, or the path to `spec.md` / `plan.md` in the run directory.
